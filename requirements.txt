@@ -1,9 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-streamlit>=1.50
+streamlit
 torch==2.5.1+cpu
-timm>=1.0.9
-opencv-python-headless>=4.9
-numpy>=1.26
-pandas>=2.0
-altair>=5.0
+timm
+opencv-python-headless
+numpy
+pandas
+altair
