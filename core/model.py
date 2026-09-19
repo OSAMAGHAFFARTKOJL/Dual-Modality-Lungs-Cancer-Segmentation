@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import timm
 import torch
@@ -128,17 +129,50 @@ def resolve_weights(progress=None) -> Path:
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     dest = WEIGHTS_DIR / "cipaformer_v2_ema_fp16.pth"
     tmp = dest.with_suffix(".part")
-    with urlopen(url) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            done += len(chunk)
-            if progress and total:
-                progress(done / total)
+
+    # a token lets the download reach a release asset in a private repo
+    token = os.environ.get("MODEL_TOKEN", "").strip()
+    if not token:
+        try:
+            import streamlit as st
+            token = str(st.secrets.get("MODEL_TOKEN", "")).strip()
+        except Exception:
+            token = ""
+    headers = {"User-Agent": "cipaformer-demo"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Accept"] = "application/octet-stream"
+
+    try:
+        with urlopen(Request(url, headers=headers)) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total)
+    except HTTPError as e:
+        tmp.unlink(missing_ok=True)
+        hint = ("GitHub answers 404 for release assets in a private repo when the request is "
+                "unauthenticated. Make the repo public, host the weights somewhere public such "
+                "as the Hugging Face Hub, or add a MODEL_TOKEN secret with repo read access."
+                ) if e.code == 404 else "Check that MODEL_URL points straight at the file."
+        raise RuntimeError(f"Could not download the weights (HTTP {e.code}). {hint}") from None
+    except URLError as e:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"Could not reach the weights URL: {e.reason}") from None
+
+    if tmp.stat().st_size < 50_000_000:
+        head = tmp.read_bytes()[:200]
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The weights URL returned something too small to be the checkpoint — it is probably "
+            f"an HTML page rather than the file. First bytes: {head[:80]!r}")
+
     tmp.replace(dest)
     return dest
 

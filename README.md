@@ -40,24 +40,42 @@ step is optional — it just makes a 118 MB fp16 copy instead of the 450 MB trai
 
 ## Deploy on Streamlit Community Cloud
 
-The weights are too large for a git repository, so they are downloaded once at first run.
+The weights are too large for a git repository (GitHub caps files at 100 MB), so they live
+outside it and are downloaded once at first run.
 
 1. **Push this folder to GitHub.** `weights/`, `checkpoints/` and the full `PCLT20K/` dataset
    are gitignored; the four slices in `samples/` are committed.
-2. **Attach the weights to a GitHub release.** In your repo, *Releases → Draft a new release →
-   Attach binaries*, and upload `weights/cipaformer_v2_ema_fp16.pth` (release assets allow up to
-   2 GB — normal repo files are capped at 100 MB). Copy the asset's download URL.
+
+2. **Host the weights on the Hugging Face Hub.** Create a **public** model repo at
+   [huggingface.co/new](https://huggingface.co/new) and upload
+   `weights/cipaformer_v2_ema_fp16.pth` — either by dragging it into *Files → Add file*, or:
+
+   ```bash
+   pip install huggingface_hub
+   hf auth login
+   hf upload <user>/cipaformer-v2-petct weights/cipaformer_v2_ema_fp16.pth
+   ```
+
+   The direct link is then
+   `https://huggingface.co/<user>/cipaformer-v2-petct/resolve/main/cipaformer_v2_ema_fp16.pth`.
+
 3. **Deploy.** Go to [share.streamlit.io](https://share.streamlit.io), connect the repo, and set
    the main file to `app.py`.
+
 4. **Add the URL as a secret.** In the app's *Settings → Secrets*, paste:
 
    ```toml
-   MODEL_URL = "https://github.com/<user>/<repo>/releases/download/v1.0/cipaformer_v2_ema_fp16.pth"
+   MODEL_URL = "https://huggingface.co/<user>/cipaformer-v2-petct/resolve/main/cipaformer_v2_ema_fp16.pth"
    ```
 
-The app downloads the weights on first boot (with a progress bar) and caches them for the
-life of the container. `MODEL_URL` is also read from the environment, so the same code runs
-anywhere.
+The app downloads the weights on first boot (with a progress bar) and caches them for the life
+of the container. `MODEL_URL` is also read from the environment, so the same code runs anywhere.
+
+> **On GitHub release assets:** a release asset works too, but only if the repo is **public**.
+> GitHub answers `404` for assets in a private repo unless the request is authenticated, and
+> the app downloads anonymously. For a private repo, either host the weights publicly as above,
+> or add a fine-grained token with repo read access as a second secret:
+> `MODEL_TOKEN = "github_pat_…"`.
 
 ### Hugging Face Spaces
 

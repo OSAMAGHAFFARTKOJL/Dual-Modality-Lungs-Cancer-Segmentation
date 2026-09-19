@@ -89,10 +89,13 @@ def decode_upload(file) -> np.ndarray | None:
 def get_model():
     bar = st.sidebar.progress(0.0, "Downloading weights…")
     try:
-        m = load_model("cpu", progress=lambda f: bar.progress(min(f, 1.0), "Downloading weights…"))
+        return load_model("cpu",
+                          progress=lambda f: bar.progress(min(f, 1.0), "Downloading weights…"))
+    except (RuntimeError, FileNotFoundError) as e:
+        st.error(f"**The model weights could not be loaded.**\n\n{e}")
+        st.stop()
     finally:
         bar.empty()
-    return m
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
