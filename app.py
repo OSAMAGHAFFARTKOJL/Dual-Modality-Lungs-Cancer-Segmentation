@@ -234,7 +234,7 @@ st.sidebar.caption("Research demo · not a medical device")
 st.markdown(
     '<div class="hero"><h1>PET/CT Lung Tumour Segmentation</h1>'
     '<span class="tag">RAMF-Net</span></div>'
-    '<div class="sub">Dual-stream PVT-v2 encoder with reliability-aware cross-modal fusion '
+    '<div class="sub"> '
     'and a U-Net decoder. Trained on PCLT20K.</div>', unsafe_allow_html=True)
 
 if ct_img is None or pet_img is None:
