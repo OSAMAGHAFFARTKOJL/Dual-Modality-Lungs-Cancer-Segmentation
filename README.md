@@ -1,4 +1,4 @@
-# PET/CT Lung Tumour Segmentation — CIPAFormer-V2 demo
+# PET/CT Lung Tumour Segmentation
 
 An interactive Streamlit app for **CIPAFormer-V2**, a dual-stream PET/CT segmentation network
 trained on PCLT20K. Pick a bundled slice or upload your own PET/CT pair, and the app runs the
