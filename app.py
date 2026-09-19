@@ -57,8 +57,6 @@ st.markdown(f"""
   .stTabs [aria-selected="true"] {{ color:{INK} !important; }}
   section[data-testid="stSidebar"] {{ background:{PANEL}; border-right:1px solid #2e2e2b; }}
   div[data-testid="stImage"] img {{ border-radius:10px; border:1px solid #2e2e2b; }}
-  .disclaimer {{ background:#2a1f12; border:1px solid #6b4a1e; color:#e8d5b5; border-radius:10px;
-                 padding:.7rem .9rem; font-size:.82rem; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -283,8 +281,7 @@ else:
     tile(cols[4], "Ground truth", "—", "", "upload a mask for metrics")
 
 st.markdown("")
-tab_seg, tab_xai, tab_metrics, tab_about = st.tabs(
-    ["Segmentation", "Explainability", "Metrics", "Model & data"])
+tab_seg, tab_xai, tab_metrics = st.tabs(["Segmentation", "Explainability", "Metrics"])
 
 
 # ---------------------------------------------------------------------- segmentation
@@ -495,41 +492,3 @@ with tab_metrics:
             f"**{best['threshold']:.2f}**; dashed line = your current threshold "
             f"**{threshold:.2f}** (Dice {stats['dice']*100:.1f}%).")
 
-
-# ---------------------------------------------------------------------------- about
-with tab_about:
-    a, b = st.columns(2)
-    a.markdown("""
-#### Architecture
-**RAMF-Net** — a dual-stream encoder–decoder for PET/CT tumour segmentation.
-
-- **Encoder** · PVT-v2-b3, weight-shared across PET and CT (4 stages, strides 4→32)
-- **Fusion** · per scale, an SE channel gate over both streams plus a 7×7 PET-derived
-  spatial gate that modulates CT as `ct × (1 + gate)`
-- **Decoder** · U-Net style, three upsampling blocks with skips, 1×1 prediction head
-- **Output** · one sigmoid channel, optional 4-view flip TTA
-- **Weights** · exponential moving average of the training weights, fp16 for deployment
-
-#### How this demo runs
-Every view of the four bundled cases is **precomputed at 512×512** and shipped with the app,
-so browsing them loads no network at all. Uploading your own slice runs the model live at
-384×384. That split is what keeps the app inside a small container's memory budget.
-""")
-    b.markdown("""
-#### Dataset
-**PCLT20K** — paired PET/CT lung slices with expert tumour masks, one folder per patient
-(`<patient>_<slice>_CT.png`, `_PET.png`, `_mask.png`). Images are 512×512 grayscale and are
-normalised to [-1.6, 1.6] before the forward pass, matching training exactly.
-
-Four slices are bundled under `samples/`, spanning an easy large lesion through to a small
-low-contrast one.
-
-#### Reported test performance
-5-seed mean on the held-out split: **IoU 64.2**, **Dice 78.2**, precision 75.0, recall 81.8,
-specificity 99.9. Per-slice scores vary widely around that mean — the bundled samples run
-between roughly 66 and 96 Dice, so they are easier than the dataset average.
-""")
-    st.markdown(
-        '<div class="disclaimer"><b>Research demo — not a medical device.</b> '
-        'Nothing here is validated for clinical use, and no output should inform diagnosis '
-        'or treatment.</div>', unsafe_allow_html=True)
