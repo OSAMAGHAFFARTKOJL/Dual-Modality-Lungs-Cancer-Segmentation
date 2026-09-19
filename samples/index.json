@@ -1,0 +1,29 @@
+{
+  "dataset": "PCLT20K",
+  "cases": [
+    {
+      "id": "0007_022",
+      "patient": "0007",
+      "slice": 22,
+      "note": "Large primary lesion, strong PET uptake"
+    },
+    {
+      "id": "0017_026",
+      "patient": "0017",
+      "slice": 26,
+      "note": "Large lesion with clear CT boundary"
+    },
+    {
+      "id": "0013_010",
+      "patient": "0013",
+      "slice": 10,
+      "note": "Small lesion, moderate uptake"
+    },
+    {
+      "id": "0002_010",
+      "patient": "0002",
+      "slice": 10,
+      "note": "Small low-contrast lesion (hard case)"
+    }
+  ]
+}

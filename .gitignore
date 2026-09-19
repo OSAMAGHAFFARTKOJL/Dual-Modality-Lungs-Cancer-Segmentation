@@ -1,0 +1,17 @@
+# model weights are distributed as a release asset, not in the repo
+weights/
+checkpoints/
+
+# full dataset (only samples/ is committed)
+PCLT20K/
+
+# local scratch
+/_*.py
+/_*.png
+/_*.log
+/_*.err
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+_archive/
