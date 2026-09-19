@@ -10,21 +10,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-TARGET_LAYERS = {
-    "Decoder · up1 (stride 4, sharpest)": lambda m: m.decoder.up1,
-    "Decoder · up2 (stride 8)": lambda m: m.decoder.up2,
-    "Decoder · up3 (stride 16)": lambda m: m.decoder.up3,
-    "Fusion · stage 4 (stride 32, most semantic)": lambda m: m.fusions[3],
-    "Fusion · stage 3 (stride 16)": lambda m: m.fusions[2],
-    "Fusion · stage 2 (stride 8)": lambda m: m.fusions[1],
-}
-
-METHODS = ("Grad-CAM", "HiRes-CAM", "Layer-CAM", "XGrad-CAM")
+from .spec import LAYERS, METHODS  # noqa: F401  (re-exported for the UI)
 
 
-def _normalise(cam: torch.Tensor) -> np.ndarray:
-    cam = cam - cam.min()
-    return (cam / (cam.max() + 1e-8)).cpu().numpy()
+def _resolve(model, dotted: str):
+    obj = model
+    for part in dotted.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
 
 
 class _Hook:
@@ -45,21 +38,46 @@ class _Hook:
         self._b.remove()
 
 
-def cam(model, ct_t, pet_t, layer_fn, method: str = "Grad-CAM",
+def _forward_for(model, ct, pet, dotted: str):
+    """Forward pass that only records an autograd graph downstream of the target layer.
+
+    No attribution target lives inside the encoder, and d(score)/d(target activation)
+    does not depend on how the target's *inputs* were produced — so running everything
+    upstream under no_grad is exact, and it keeps the encoder's activations (by far the
+    largest part of the graph at 512x512) out of memory.
+    """
+    out_size = ct.shape[2:]
+    with torch.no_grad():
+        cf = model.encoder(ct)
+        pf = model.encoder(pet)
+
+    if dotted.startswith("fusions"):
+        fused = [model.fusions[i](cf[i].detach(), pf[i].detach()) for i in range(4)]
+    else:
+        with torch.no_grad():
+            fused = [model.fusions[i](cf[i], pf[i]) for i in range(4)]
+        fused = [f.detach() for f in fused]
+
+    return model.decoder(fused, out_size)
+
+
+def cam(model, ct_t, pet_t, layer: str, method: str = "Grad-CAM",
         target: np.ndarray | None = None, threshold: float = 0.5) -> np.ndarray:
     """Class-activation map upsampled to the input resolution, normalised to [0, 1]."""
-    hook = _Hook(layer_fn(model))
+    dotted = LAYERS[layer]
+    hook = _Hook(_resolve(model, dotted))
     try:
         model.zero_grad(set_to_none=True)
-        logits = model(ct_t, pet_t)
-        prob = torch.sigmoid(logits)
+        with torch.enable_grad():
+            logits = _forward_for(model, ct_t, pet_t, dotted)
+            prob = torch.sigmoid(logits)
 
-        if target is not None:
-            region = torch.from_numpy(target.astype(np.float32))[None, None].to(logits.device)
-        else:
-            region = (prob >= threshold).float()
-        score = (logits * region).sum() if region.sum() > 0 else (logits * prob).sum()
-        score.backward()
+            if target is not None:
+                region = torch.from_numpy(target.astype(np.float32))[None, None].to(logits.device)
+            else:
+                region = (prob >= threshold).float()
+            score = (logits * region).sum() if region.sum() > 0 else (logits * prob).sum()
+            score.backward()
 
         acts, grads = hook.acts, hook.grads
         if method == "HiRes-CAM":
@@ -71,29 +89,22 @@ def cam(model, ct_t, pet_t, layer_fn, method: str = "Grad-CAM",
                 (acts.sum(dim=(2, 3), keepdim=True) + 1e-8)
             weighted = w * acts
         else:
-            w = grads.mean(dim=(2, 3), keepdim=True)
-            weighted = w * acts
+            weighted = grads.mean(dim=(2, 3), keepdim=True) * acts
 
         heat = F.relu(weighted.sum(dim=1, keepdim=True))
         heat = F.interpolate(heat, size=ct_t.shape[2:], mode="bilinear", align_corners=False)
-        return _normalise(heat[0, 0])
+        heat = heat[0, 0]
+        heat = heat - heat.min()
+        return (heat / (heat.max() + 1e-8)).cpu().numpy()
     finally:
         hook.close()
         model.zero_grad(set_to_none=True)
 
 
-def pet_gate_map(model, scale: int = 0) -> np.ndarray | None:
+def pet_gate_map(model, scale: int, size: int) -> np.ndarray | None:
     """The learned PET->CT spatial gate at one fusion scale, in [0, 1]."""
-    gates = model.pet_gates()
-    g = gates[scale]
+    g = model.pet_gates()[scale]
     if g is None:
         return None
-    g = F.interpolate(g, size=(512, 512), mode="bilinear", align_corners=False)
+    g = F.interpolate(g, size=(size, size), mode="bilinear", align_corners=False)
     return g[0, 0].cpu().numpy()
-
-
-def entropy_map(prob: np.ndarray) -> np.ndarray:
-    """Per-pixel binary entropy, normalised so 0.5 probability = 1.0."""
-    p = np.clip(prob, 1e-6, 1 - 1e-6)
-    h = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
-    return h.astype(np.float32)

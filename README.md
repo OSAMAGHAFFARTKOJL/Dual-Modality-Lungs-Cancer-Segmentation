@@ -1,6 +1,6 @@
-# PET/CT Lung Tumour Segmentation
+# RAMF-Net — PET/CT Lung Tumour Segmentation
 
-An interactive Streamlit app for **CIPAFormer-V2**, a dual-stream PET/CT segmentation network
+An interactive Streamlit app for **RAMF-Net**, a dual-stream PET/CT segmentation network
 trained on PCLT20K. Pick a bundled slice or upload your own PET/CT pair, and the app runs the
 real checkpoint and shows the mask, the metrics, and *why* the network fired where it did.
 
@@ -27,16 +27,39 @@ sharpest decoder block to the most semantic fusion stage. Also on this tab:
 **Metrics** — Dice, IoU, precision, recall, specificity, accuracy, HD95, ASSD, confusion
 counts, and a threshold sweep that marks the Dice-optimal operating point.
 
+## How it runs inside a small container
+
+Every view of the four bundled cases is precomputed at 512×512 into `samples/precomputed/`
+(~0.4 MB per case) and shipped with the app, so browsing them imports no torch and loads no
+weights — the sample path peaks around 150 MB. Only a user-supplied slice runs the network,
+at 384×384.
+
+Two things make the live path fit as well. The fp16 checkpoint is copied straight into the
+fp32 parameters by `load_state_dict` rather than being converted first, which avoids a
+redundant 235 MB. And Grad-CAM runs the encoder under `no_grad`: no attribution target lives
+inside the encoder, and the gradient at the target layer does not depend on how that layer's
+inputs were produced, so skipping the encoder's graph is exact — verified bit-identical
+against the full-graph version across all 24 method/layer combinations. Together these cut
+peak RSS from ~1.1 GB to ~850 MB at 512×512.
+
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
-python tools/export_weights.py checkpoints/best.pth weights/cipaformer_v2_ema_fp16.pth
 streamlit run app.py
 ```
 
-If you already have `checkpoints/best.pth` in place, the app loads it directly and the export
-step is optional — it just makes a 118 MB fp16 copy instead of the 450 MB training checkpoint.
+That is enough to browse the bundled cases — they are precomputed. To run the model yourself
+(uploads, or regenerating the precomputed views) you also need the weights:
+
+```bash
+python tools/export_weights.py checkpoints/best.pth weights/cipaformer_v2_ema_fp16.pth
+python tools/precompute_samples.py      # only after changing the checkpoint or the sample list
+```
+
+With `checkpoints/best.pth` present the app loads it directly; the export step just makes a
+118 MB fp16 copy of the 450 MB training checkpoint. With neither file present, the weights are
+fetched from the URL below.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -53,11 +76,11 @@ outside it and are downloaded once at first run.
    ```bash
    pip install huggingface_hub
    hf auth login
-   hf upload <user>/cipaformer-v2-petct weights/cipaformer_v2_ema_fp16.pth
+   hf upload <user>/<repo> weights/cipaformer_v2_ema_fp16.pth
    ```
 
    The direct link is then
-   `https://huggingface.co/<user>/cipaformer-v2-petct/resolve/main/cipaformer_v2_ema_fp16.pth`.
+   `https://huggingface.co/<user>/<repo>/resolve/main/cipaformer_v2_ema_fp16.pth`.
 
 3. **Deploy.** Go to [share.streamlit.io](https://share.streamlit.io), connect the repo, and set
    the main file to `app.py`.
@@ -97,12 +120,16 @@ which point Streamlit Cloud or Spaces is doing the same job with none of the plu
 
 ```
 app.py                  Streamlit UI
-core/model.py           CIPAFormer-V2 architecture + checkpoint resolution
-core/inference.py       preprocessing, prediction, TTA, metrics
-core/explain.py         Grad-CAM family, PET gate maps, entropy
-core/viz.py             overlays and composite figures
-samples/                four PCLT20K slices (CT / PET / mask)
-tools/export_weights.py training checkpoint -> slim fp16 inference weights
+core/spec.py               names the UI and the precompute step share (torch-free)
+core/metrics.py            image prep and segmentation metrics (torch-free)
+core/viz.py                overlays and composite figures (torch-free)
+core/model.py              RAMF-Net architecture + checkpoint resolution
+core/inference.py          preprocessing, prediction, TTA
+core/explain.py            Grad-CAM family, PET gate maps
+samples/                   four PCLT20K slices (CT / PET / mask)
+samples/precomputed/       every view of those cases, baked
+tools/export_weights.py    training checkpoint -> slim fp16 inference weights
+tools/precompute_samples.py  regenerate samples/precomputed/
 ```
 
 ## Model

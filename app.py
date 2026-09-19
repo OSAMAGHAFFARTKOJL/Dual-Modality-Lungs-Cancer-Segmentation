@@ -1,4 +1,8 @@
-"""CIPAFormer-V2 · PET/CT lung tumour segmentation — interactive demo."""
+"""RAMF-Net · PET/CT lung tumour segmentation — interactive demo.
+
+The bundled sample cases are served from precomputed arrays, so browsing them never
+imports torch. A user-supplied slice is the only path that loads the network.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -11,13 +15,13 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
 
-from core import explain, inference, viz
-from core.model import load_model
+from core import metrics as M
+from core import spec, viz
 
 ROOT = Path(__file__).resolve().parent
 SAMPLES = ROOT / "samples"
+PRECOMPUTED = SAMPLES / "precomputed"
 
 SURFACE = "#12120f"
 PANEL = "#1a1a19"
@@ -25,7 +29,7 @@ INK = "#f5f5f0"
 INK_DIM = "#a3a29b"
 SERIES = ["#3987e5", "#d95926", "#199e70"]
 
-st.set_page_config(page_title="CIPAFormer-V2 · PET/CT Tumour Segmentation",
+st.set_page_config(page_title="RAMF-Net · PET/CT Tumour Segmentation",
                    page_icon="🫁", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(f"""
@@ -48,7 +52,6 @@ st.markdown(f"""
              margin:.4rem 0 .1rem; }}
   .legend span.dot {{ display:inline-block; width:10px; height:10px; border-radius:3px;
                       margin-right:.35rem; vertical-align:middle; }}
-  .caption {{ color:{INK_DIM}; font-size:.78rem; margin-top:-.4rem; }}
   .stTabs [data-baseweb="tab-list"] {{ gap:.25rem; border-bottom:1px solid #2e2e2b; }}
   .stTabs [data-baseweb="tab"] {{ height:2.5rem; padding:0 1rem; color:{INK_DIM}; }}
   .stTabs [aria-selected="true"] {{ color:{INK} !important; }}
@@ -60,33 +63,51 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ----------------------------------------------------------------------------- data
+# ------------------------------------------------------------------- precomputed path
 @st.cache_data(show_spinner=False)
 def load_sample_index() -> list[dict]:
-    idx = json.loads((SAMPLES / "index.json").read_text())
-    return idx["cases"]
+    return json.loads((SAMPLES / "index.json").read_text())["cases"]
 
 
 @st.cache_data(show_spinner=False)
-def load_sample(case_id: str):
+def load_sample_images(case_id: str):
     d = SAMPLES / case_id
     read = lambda n: cv2.imread(str(d / n), cv2.IMREAD_GRAYSCALE)
     return read("ct.png"), read("pet.png"), read("mask.png")
 
 
-def decode_upload(file) -> np.ndarray | None:
-    if file is None:
-        return None
-    buf = np.frombuffer(file.getvalue(), np.uint8)
-    img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        st.sidebar.error(f"Could not read {file.name}")
-    return img
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_precomputed(case_id: str) -> dict:
+    with np.load(PRECOMPUTED / f"{case_id}.npz") as z:
+        return {k: z[k] for k in z.files}
 
 
-# ---------------------------------------------------------------------------- model
+class Precomputed:
+    """Serves the baked arrays for a bundled case. Never touches the model."""
+
+    live = False
+    size = spec.IMG_SIZE
+
+    def __init__(self, case_id: str, tta: bool):
+        z = load_precomputed(case_id)
+        self._cams = z["cams"]
+        self._methods = list(z["methods"])
+        self._layers = list(z["layers"])
+        self.prob = z["prob_tta" if tta else "prob"].astype(np.float32) / 65535.0
+        self.std = z["std_tta"].astype(np.float32) / 255.0 if tta else None
+        self.gates = [g.astype(np.float32) / 255.0 for g in z["gates"]]
+        self.prob_ct = z["prob_ct"].astype(np.float32) / 65535.0
+        self.prob_pet = z["prob_pet"].astype(np.float32) / 65535.0
+
+    def cam(self, method: str, layer: str) -> np.ndarray:
+        i, j = self._methods.index(method), self._layers.index(layer)
+        return self._cams[i, j].astype(np.float32) / 255.0
+
+
+# -------------------------------------------------------------------------- live path
 @st.cache_resource(show_spinner=False)
 def get_model():
+    from core.model import load_model
     bar = st.sidebar.progress(0.0, "Downloading weights…")
     try:
         return load_model("cpu",
@@ -98,30 +119,60 @@ def get_model():
         bar.empty()
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def run_inference(key: str, ct: np.ndarray, pet: np.ndarray, tta: bool):
+@st.cache_data(show_spinner=False, max_entries=2)
+def _live_predict(key: str, ct: np.ndarray, pet: np.ndarray, tta: bool):
+    from core import explain, inference
     model = get_model()
-    ct_t, pet_t = inference.preprocess(ct, pet)
-    t0 = time.perf_counter()
+    ct_t, pet_t = inference.preprocess(ct, pet, spec.UPLOAD_SIZE)
     prob, std = inference.predict(model, ct_t, pet_t, tta=tta)
-    gates = [explain.pet_gate_map(model, s) for s in range(4)]
-    return prob, std, gates, time.perf_counter() - t0
+    gates = [explain.pet_gate_map(model, s, spec.UPLOAD_SIZE) for s in range(4)]
+    return prob, std, gates
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def run_cam(key: str, ct: np.ndarray, pet: np.ndarray, method: str, layer: str, threshold: float):
+@st.cache_data(show_spinner=False, max_entries=4)
+def _live_cam(key: str, ct: np.ndarray, pet: np.ndarray, method: str, layer: str):
+    from core import explain, inference
     model = get_model()
-    ct_t, pet_t = inference.preprocess(ct, pet)
-    return explain.cam(model, ct_t, pet_t, explain.TARGET_LAYERS[layer], method=method,
-                       threshold=threshold)
+    ct_t, pet_t = inference.preprocess(ct, pet, spec.UPLOAD_SIZE)
+    return explain.cam(model, ct_t, pet_t, layer, method=method)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def run_modality_ablation(key: str, ct: np.ndarray, pet: np.ndarray):
+@st.cache_data(show_spinner=False, max_entries=2)
+def _live_ablation(key: str, ct: np.ndarray, pet: np.ndarray):
+    from core import inference
     model = get_model()
-    ct_t, pet_t = inference.preprocess(ct, pet)
+    ct_t, pet_t = inference.preprocess(ct, pet, spec.UPLOAD_SIZE)
     return (inference.predict_single_modality(model, ct_t, pet_t, "ct"),
             inference.predict_single_modality(model, ct_t, pet_t, "pet"))
+
+
+class Live:
+    """Runs the network on a user-supplied slice, at a reduced size to stay inside the
+    container's memory budget."""
+
+    live = True
+    size = spec.UPLOAD_SIZE
+
+    def __init__(self, key: str, ct: np.ndarray, pet: np.ndarray, tta: bool):
+        self._args = (key, ct, pet)
+        self.prob, std, self.gates = _live_predict(key, ct, pet, tta)
+        self.std = std if tta else None
+
+    def cam(self, method: str, layer: str) -> np.ndarray:
+        return _live_cam(*self._args, method, layer)
+
+    @property
+    def ablation(self):
+        return _live_ablation(*self._args)
+
+
+def decode_upload(file) -> np.ndarray | None:
+    if file is None:
+        return None
+    img = cv2.imdecode(np.frombuffer(file.getvalue(), np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        st.sidebar.error(f"Could not read {file.name}")
+    return img
 
 
 def tile(col, label: str, value: str, unit: str = "", foot: str = ""):
@@ -146,30 +197,29 @@ source = st.sidebar.radio("Source", ["Sample cases", "Upload PET/CT"], label_vis
                           horizontal=True)
 
 ct_img = pet_img = gt_raw = None
-case_label = ""
 
 if source == "Sample cases":
     cases = load_sample_index()
     labels = {f'{c["id"]} · {c["note"]}': c["id"] for c in cases}
     case_id = labels[st.sidebar.selectbox("Case", list(labels))]
-    ct_img, pet_img, gt_raw = load_sample(case_id)
+    ct_img, pet_img, gt_raw = load_sample_images(case_id)
     case_label = f"PCLT20K · patient {case_id.split('_')[0]} · slice {int(case_id.split('_')[1])}"
-    key = f"sample:{case_id}"
+    key = case_id
 else:
-    up_ct = st.sidebar.file_uploader("CT slice (PNG/JPG)", type=["png", "jpg", "jpeg", "bmp", "tif"])
-    up_pet = st.sidebar.file_uploader("PET slice (PNG/JPG)", type=["png", "jpg", "jpeg", "bmp", "tif"])
+    up_ct = st.sidebar.file_uploader("CT slice", type=["png", "jpg", "jpeg", "bmp", "tif"])
+    up_pet = st.sidebar.file_uploader("PET slice", type=["png", "jpg", "jpeg", "bmp", "tif"])
     up_gt = st.sidebar.file_uploader("Ground-truth mask (optional)",
                                      type=["png", "jpg", "jpeg", "bmp", "tif"])
     ct_img, pet_img, gt_raw = decode_upload(up_ct), decode_upload(up_pet), decode_upload(up_gt)
     case_label = "Uploaded slice"
-    key = "upload:" + hashlib.sha1(
-        b"".join(f.getvalue() for f in (up_ct, up_pet) if f is not None)).hexdigest()[:16]
+    key = hashlib.sha1(b"".join(f.getvalue() for f in (up_ct, up_pet)
+                                if f is not None)).hexdigest()[:16]
 
 st.sidebar.markdown("### Inference")
 threshold = st.sidebar.slider("Decision threshold", 0.05, 0.95, 0.50, 0.01)
-tta = st.sidebar.toggle("Flip TTA (4 views, slower)", value=False,
-                        help="Averages 4 flipped views — steadier masks and a variance-based "
-                             "uncertainty map, at ~4× the compute.")
+tta = st.sidebar.toggle("Flip TTA (4 views)", value=False,
+                        help="Averages 4 flipped views — steadier masks, plus a "
+                             "disagreement map that reads as uncertainty.")
 
 st.sidebar.markdown("### Display")
 cmap = st.sidebar.selectbox("Heatmap colormap", list(viz.COLORMAPS), index=0)
@@ -185,9 +235,9 @@ st.sidebar.caption("Research demo · not a medical device")
 # ----------------------------------------------------------------------------- head
 st.markdown(
     '<div class="hero"><h1>PET/CT Lung Tumour Segmentation</h1>'
-    '<span class="tag">CIPAFormer-V2</span></div>'
-    '<div class="sub">Dual-stream PVT-v2 encoder with cross-modal SE + PET-spatial gating, '
-    'U-Net decoder. Trained on PCLT20K.</div>', unsafe_allow_html=True)
+    '<span class="tag">RAMF-Net</span></div>'
+    '<div class="sub">Dual-stream PVT-v2 encoder with reliability-aware cross-modal fusion '
+    'and a U-Net decoder. Trained on PCLT20K.</div>', unsafe_allow_html=True)
 
 if ct_img is None or pet_img is None:
     st.info("Upload a **CT** and a **PET** slice in the sidebar, or switch to *Sample cases* "
@@ -196,32 +246,40 @@ if ct_img is None or pet_img is None:
 
 if ct_img.shape[:2] != pet_img.shape[:2]:
     st.warning(f"CT is {ct_img.shape[:2]} and PET is {pet_img.shape[:2]} — both are resampled "
-               "to 512×512 before inference.")
+               "before inference.")
 
-with st.spinner("Running CIPAFormer-V2…"):
-    prob, std, gates, elapsed = run_inference(key, ct_img, pet_img, tta)
+t0 = time.perf_counter()
+if source == "Sample cases":
+    result = Precomputed(key, tta)
+else:
+    with st.spinner("Running RAMF-Net on your slice…"):
+        result = Live(key, ct_img, pet_img, tta)
+elapsed = time.perf_counter() - t0
 
+size = result.size
+prob = result.prob
 pred = (prob >= threshold).astype(np.uint8)
-gt = inference.binarize_mask(gt_raw) if gt_raw is not None else None
-stats = inference.metrics(prob, gt, threshold)
+gt = M.binarize_mask(gt_raw, size) if gt_raw is not None else None
+stats = M.metrics(prob, gt, threshold)
 
-ct_disp = viz.window(inference.resize(inference.to_gray(ct_img)), brightness, contrast)
-pet_disp = inference.resize(inference.to_gray(pet_img))
+ct_disp = viz.window(M.resize(M.to_gray(ct_img), size), brightness, contrast)
+pet_disp = M.resize(M.to_gray(pet_img), size)
 pet_rgb = viz.colorize(pet_disp.astype(np.float32) / 255.0, "inferno")
 
 cols = st.columns(5)
 if gt is not None:
     tile(cols[0], "Dice", f"{stats['dice']*100:.1f}", "%", "overlap with ground truth")
     tile(cols[1], "IoU", f"{stats['iou']*100:.1f}", "%", "Jaccard index")
-    tile(cols[2], "Precision", f"{stats['precision']*100:.1f}", "%", f"{stats['fp']} false-positive px")
+    tile(cols[2], "Precision", f"{stats['precision']*100:.1f}", "%",
+         f"{stats['fp']} false-positive px")
     tile(cols[3], "Recall", f"{stats['recall']*100:.1f}", "%", f"{stats['fn']} missed px")
     hd = stats["hd95"]
     tile(cols[4], "HD95", f"{hd:.1f}" if hd is not None else "—", " px", "95th-pct boundary error")
 else:
     tile(cols[0], "Tumour area", f"{stats['pred_px']:,}", " px", f"at threshold {threshold:.2f}")
     tile(cols[1], "Peak confidence", f"{stats['max_conf']*100:.1f}", "%", "max sigmoid output")
-    tile(cols[2], "Mean confidence", f"{stats['mean_conf']*100:.1f}", "%", "inside predicted region")
-    tile(cols[3], "Runtime", f"{elapsed:.1f}", " s", "CPU forward pass" + (" ×4 TTA" if tta else ""))
+    tile(cols[2], "Mean confidence", f"{stats['mean_conf']*100:.1f}", "%", "inside prediction")
+    tile(cols[3], "Resolution", f"{size}", " px", "live inference" if result.live else "precomputed")
     tile(cols[4], "Ground truth", "—", "", "upload a mask for metrics")
 
 st.markdown("")
@@ -231,7 +289,8 @@ tab_seg, tab_xai, tab_metrics, tab_about = st.tabs(
 
 # ---------------------------------------------------------------------- segmentation
 with tab_seg:
-    st.caption(f"{case_label} · {elapsed:.1f}s on CPU{' · flip TTA' if tta else ''}")
+    mode = f"{elapsed:.1f}s live at {size}px" if result.live else "precomputed"
+    st.caption(f"{case_label} · {mode}{' · flip TTA' if tta else ''}")
     c = st.columns(4)
     c[0].image(ct_disp, caption="CT", width="stretch")
     c[1].image(pet_rgb, caption="PET", width="stretch")
@@ -264,12 +323,10 @@ with tab_seg:
                     caption="Predicted contour", width="stretch")
         c2[1].image(viz.heat_overlay(pet_rgb, prob, alpha, cmap, floor=0.05),
                     caption="Probability on PET", width="stretch")
-        c2[2].image(viz.colorize(prob, cmap), caption="Raw probability map",
-                    width="stretch")
+        c2[2].image(viz.colorize(prob, cmap), caption="Raw probability map", width="stretch")
         c2[3].empty()
 
-    panels = [("CT", viz.to_rgb(ct_disp)),
-              ("PET", pet_rgb),
+    panels = [("CT", viz.to_rgb(ct_disp)), ("PET", pet_rgb),
               ("Probability", viz.heat_overlay(ct_disp, prob, alpha, cmap, floor=0.05)),
               ("Prediction", viz.mask_overlay(ct_disp, pred, viz.PRED_COLOR, alpha))]
     if gt is not None:
@@ -278,49 +335,45 @@ with tab_seg:
 
     d = st.columns(3)
     d[0].download_button("Download mask (PNG)", viz.png_bytes(viz.to_rgb(pred * 255)),
-                         f"{key.split(':')[-1]}_mask.png", "image/png", width="stretch")
-    d[1].download_button("Download probability map (PNG)",
-                         viz.png_bytes(viz.colorize(prob, cmap)),
-                         f"{key.split(':')[-1]}_probability.png", "image/png",
-                         width="stretch")
+                         f"{key}_mask.png", "image/png", width="stretch")
+    d[1].download_button("Download probability map (PNG)", viz.png_bytes(viz.colorize(prob, cmap)),
+                         f"{key}_probability.png", "image/png", width="stretch")
     d[2].download_button("Download report figure (PNG)",
                          viz.png_bytes(viz.side_by_side(panels, cols=3)),
-                         f"{key.split(':')[-1]}_report.png", "image/png", width="stretch")
+                         f"{key}_report.png", "image/png", width="stretch")
 
 
 # -------------------------------------------------------------------- explainability
 with tab_xai:
-    left, right = st.columns([1, 1])
-    with left:
-        method = st.selectbox("Attribution method", explain.METHODS,
-                              help="Gradient-based saliency adapted to segmentation: the score "
-                                   "back-propagated is the logit energy inside the predicted "
-                                   "tumour region.")
-    with right:
-        layer = st.selectbox("Target layer", list(explain.TARGET_LAYERS))
+    left, right = st.columns(2)
+    method = left.selectbox("Attribution method", list(spec.METHODS),
+                            help="Gradient saliency adapted to segmentation: the score "
+                                 "back-propagated is the logit energy inside the predicted "
+                                 "tumour, not a class score.")
+    layer = right.selectbox("Target layer", list(spec.LAYERS))
 
     with st.spinner(f"Computing {method}…"):
-        heat = run_cam(key, ct_img, pet_img, method, layer, threshold)
+        heat = result.cam(method, layer)
 
     c = st.columns(3)
     c[0].image(viz.heat_overlay(ct_disp, heat, alpha, cmap),
                caption=f"{method} on CT", width="stretch")
     c[1].image(viz.heat_overlay(pet_rgb, heat, alpha, cmap),
                caption=f"{method} on PET", width="stretch")
-    contour = viz.contour_compare(ct_disp, gt, pred)
-    c[2].image(viz.heat_overlay(contour, heat, alpha, cmap, floor=0.15),
+    c[2].image(viz.heat_overlay(viz.contour_compare(ct_disp, gt, pred), heat, alpha, cmap,
+                                floor=0.15),
                caption="Attribution + contours", width="stretch")
     inside = float(heat[pred > 0].mean()) if pred.sum() else 0.0
-    st.caption(f"Mean attribution inside the predicted region: **{inside:.2f}** "
-               f"vs **{float(heat[pred == 0].mean()):.2f}** outside — higher contrast means the "
-               f"evidence is better localised on the lesion.")
+    st.caption(f"Mean attribution inside the predicted region: **{inside:.2f}** vs "
+               f"**{float(heat[pred == 0].mean()):.2f}** outside — the wider that gap, the more "
+               f"the evidence is concentrated on the lesion.")
 
     st.markdown("#### Learned PET→CT gate")
-    st.caption("This network modulates CT features by a spatial gate derived from PET "
-               "(`ct × (1 + gate)`). The maps below are that gate at each fusion scale — "
-               "bright means PET is pushing the CT stream hardest there.")
+    st.caption("The network modulates CT features by a spatial gate derived from PET "
+               "(`ct × (1 + gate)`). These are that gate at each fusion scale — bright means "
+               "PET is pushing the CT stream hardest there.")
     gc = st.columns(4)
-    for i, g in enumerate(gates):
+    for i, g in enumerate(result.gates):
         stride = 4 * 2 ** i
         if g is None:
             continue
@@ -337,15 +390,14 @@ with tab_xai:
 
     st.markdown("#### Uncertainty")
     uc = st.columns(3)
-    ent = explain.entropy_map(prob)
+    ent = M.entropy_map(prob)
     uc[0].image(viz.heat_overlay(ct_disp, ent, alpha, cmap),
-                caption=f"Predictive entropy · peak {ent.max():.2f} bits",
-                width="stretch")
+                caption=f"Predictive entropy · peak {ent.max():.2f} bits", width="stretch")
     band = ((prob > 0.3) & (prob < 0.7)).astype(np.uint8)
     uc[1].image(viz.mask_overlay(ct_disp, band, (234, 179, 8), alpha),
-                caption=f"Ambiguous band 0.3–0.7 · {int(band.sum()):,} px",
-                width="stretch")
-    if tta:
+                caption=f"Ambiguous band 0.3–0.7 · {int(band.sum()):,} px", width="stretch")
+    if result.std is not None:
+        std = result.std
         uc[2].image(viz.heat_overlay(ct_disp, std / (std.max() + 1e-8), alpha, cmap),
                     caption=f"TTA disagreement · max σ {std.max():.3f}", width="stretch")
     else:
@@ -353,27 +405,21 @@ with tab_xai:
                    "disagreement map.")
 
     st.markdown("#### Modality importance")
-    st.caption("Each modality is blanked in turn to measure what the other one alone can recover.")
-    with st.spinner("Running single-modality passes…"):
-        prob_ct, prob_pet = run_modality_ablation(key, ct_img, pet_img)
+    st.caption("Each modality is blanked in turn to measure what the other one alone recovers.")
+    prob_ct, prob_pet = (result.ablation if result.live else (result.prob_ct, result.prob_pet))
 
     mc = st.columns(3)
-    mc[0].image(viz.mask_overlay(ct_disp, (prob >= threshold).astype(np.uint8),
-                                 viz.PRED_COLOR, alpha),
-                caption="PET + CT (full model)", width="stretch")
-    mc[1].image(viz.mask_overlay(ct_disp, (prob_ct >= threshold).astype(np.uint8),
-                                 viz.PRED_COLOR, alpha),
-                caption="CT only (PET blanked)", width="stretch")
-    mc[2].image(viz.mask_overlay(ct_disp, (prob_pet >= threshold).astype(np.uint8),
-                                 viz.PRED_COLOR, alpha),
-                caption="PET only (CT blanked)", width="stretch")
+    for col, p, cap in ((mc[0], prob, "PET + CT (full model)"),
+                        (mc[1], prob_ct, "CT only (PET blanked)"),
+                        (mc[2], prob_pet, "PET only (CT blanked)")):
+        col.image(viz.mask_overlay(ct_disp, (p >= threshold).astype(np.uint8),
+                                   viz.PRED_COLOR, alpha), caption=cap, width="stretch")
 
     if gt is not None:
-        rows = [("PET + CT", inference.metrics(prob, gt, threshold)["dice"]),
-                ("CT only", inference.metrics(prob_ct, gt, threshold)["dice"]),
-                ("PET only", inference.metrics(prob_pet, gt, threshold)["dice"])]
-        df = pd.DataFrame(rows, columns=["input", "dice"])
-        df["pct"] = df["dice"] * 100
+        df = pd.DataFrame([("PET + CT", M.metrics(prob, gt, threshold)["dice"] * 100),
+                           ("CT only", M.metrics(prob_ct, gt, threshold)["dice"] * 100),
+                           ("PET only", M.metrics(prob_pet, gt, threshold)["dice"] * 100)],
+                          columns=["input", "pct"])
         y_enc = alt.Y("input:N", sort=None, title=None)
         x_enc = alt.X("pct:Q", title="Dice (%)", scale=alt.Scale(domain=[0, 100]),
                       axis=alt.Axis(tickCount=6))
@@ -391,8 +437,8 @@ with tab_xai:
 # --------------------------------------------------------------------------- metrics
 with tab_metrics:
     if gt is None:
-        st.info("Metrics need a ground-truth mask. Pick a sample case, or upload a mask alongside "
-                "your PET/CT pair.")
+        st.info("Metrics need a ground-truth mask. Pick a sample case, or upload a mask "
+                "alongside your PET/CT pair.")
     else:
         rows = [
             ("Dice / F1", f"{stats['dice']*100:.2f} %"),
@@ -413,7 +459,7 @@ with tab_metrics:
         mleft.dataframe(pd.DataFrame(rows, columns=["Metric", "Value"]),
                         hide_index=True, width="stretch", height=490)
 
-        sweep = pd.DataFrame(inference.sweep_threshold(prob, gt), columns=["threshold", "Dice", "IoU"])
+        sweep = pd.DataFrame(M.sweep_threshold(prob, gt), columns=["threshold", "Dice", "IoU"])
         long = sweep.melt("threshold", var_name="metric", value_name="score")
         long["score"] *= 100
         best = sweep.loc[sweep["Dice"].idxmax()]
@@ -425,7 +471,8 @@ with tab_metrics:
                           legend=alt.Legend(orient="top", direction="horizontal",
                                             symbolType="stroke", symbolStrokeWidth=3))
         x = alt.X("threshold:Q", title="Decision threshold",
-                  scale=alt.Scale(domain=[0, 1], nice=False), axis=alt.Axis(tickCount=6, format=".1f"))
+                  scale=alt.Scale(domain=[0, 1], nice=False),
+                  axis=alt.Axis(tickCount=6, format=".1f"))
         y = alt.Y("score:Q", title="Score (%)", scale=alt.Scale(domain=[0, 100]))
 
         lines = alt.Chart(long).mark_line(strokeWidth=2).encode(x=x, y=y, color=color)
@@ -454,14 +501,19 @@ with tab_about:
     a, b = st.columns(2)
     a.markdown("""
 #### Architecture
-**CIPAFormer-V2** — a dual-stream encoder–decoder for PET/CT tumour segmentation.
+**RAMF-Net** — a dual-stream encoder–decoder for PET/CT tumour segmentation.
 
 - **Encoder** · PVT-v2-b3, weight-shared across PET and CT (4 stages, strides 4→32)
-- **Fusion** · per-stage `CrossModalFusion`: an SE channel gate over the concatenated
-  streams, plus a 7×7 PET-derived spatial gate that modulates CT as `ct × (1 + gate)`
-- **Decoder** · U-Net style, three upsampling blocks with skip connections, 1×1 prediction head
-- **Inference** · 512×512, single sigmoid channel, optional 4-view flip TTA
-- **Weights** · exponential moving average of the training weights
+- **Fusion** · per scale, an SE channel gate over both streams plus a 7×7 PET-derived
+  spatial gate that modulates CT as `ct × (1 + gate)`
+- **Decoder** · U-Net style, three upsampling blocks with skips, 1×1 prediction head
+- **Output** · one sigmoid channel, optional 4-view flip TTA
+- **Weights** · exponential moving average of the training weights, fp16 for deployment
+
+#### How this demo runs
+Every view of the four bundled cases is **precomputed at 512×512** and shipped with the app,
+so browsing them loads no network at all. Uploading your own slice runs the model live at
+384×384. That split is what keeps the app inside a small container's memory budget.
 """)
     b.markdown("""
 #### Dataset
@@ -469,13 +521,13 @@ with tab_about:
 (`<patient>_<slice>_CT.png`, `_PET.png`, `_mask.png`). Images are 512×512 grayscale and are
 normalised to [-1.6, 1.6] before the forward pass, matching training exactly.
 
-Four slices are bundled with this app under `samples/`, chosen to span an easy large lesion
-through to a small low-contrast one.
+Four slices are bundled under `samples/`, spanning an easy large lesion through to a small
+low-contrast one.
 
 #### Reported test performance
 5-seed mean on the held-out split: **IoU 64.2**, **Dice 78.2**, precision 75.0, recall 81.8,
-specificity 99.9. Per-slice scores in this demo vary widely around that mean — the bundled
-samples are individually easier than the dataset average.
+specificity 99.9. Per-slice scores vary widely around that mean — the bundled samples run
+between roughly 66 and 96 Dice, so they are easier than the dataset average.
 """)
     st.markdown(
         '<div class="disclaimer"><b>Research demo — not a medical device.</b> '

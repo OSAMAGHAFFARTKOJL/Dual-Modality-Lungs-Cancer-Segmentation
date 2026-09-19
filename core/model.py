@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 BACKBONE = "pvt_v2_b3"
-IMG_SIZE = 512
 
 ROOT = Path(__file__).resolve().parent.parent
 WEIGHTS_DIR = ROOT / "weights"
