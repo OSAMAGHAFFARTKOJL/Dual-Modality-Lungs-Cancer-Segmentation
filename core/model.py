@@ -5,6 +5,7 @@ keys will not line up.
 """
 from __future__ import annotations
 
+import gc
 import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -192,10 +193,15 @@ def load_model(device: str = "cpu", progress=None) -> CIPAFormerV2:
         state = ckpt["model"]
     else:
         state = ckpt
-    state = {k: (v.float() if torch.is_floating_point(v) else v) for k, v in state.items()}
 
+    # load_state_dict casts on copy, so the fp16 tensors go straight into the fp32
+    # parameters -- materialising a float() copy of the whole checkpoint first would
+    # add ~235 MB of peak RSS, which is what a small container cannot spare.
     model = CIPAFormerV2()
     missing, _ = model.load_state_dict(state, strict=False)
     if missing:
         raise RuntimeError(f"checkpoint is missing {len(missing)} keys, e.g. {missing[:3]}")
+
+    del state, ckpt
+    gc.collect()
     return model.eval().to(device)
