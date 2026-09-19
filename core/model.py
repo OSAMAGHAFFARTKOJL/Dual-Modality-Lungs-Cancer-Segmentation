@@ -25,6 +25,10 @@ WEIGHT_CANDIDATES = (
     ROOT / "checkpoints" / "best.pth",
 )
 
+# Public mirror of the fp16 EMA weights; MODEL_URL overrides it.
+DEFAULT_MODEL_URL = ("https://huggingface.co/OsamaGhaffar/lung_segmentation/"
+                     "resolve/main/cipaformer_v2_ema_fp16.pth")
+
 
 class CrossModalFusion(nn.Module):
     """SE channel gate on both streams + a PET-derived spatial gate applied to CT."""
@@ -120,11 +124,7 @@ def resolve_weights(progress=None) -> Path:
             url = str(st.secrets.get("MODEL_URL", "")).strip()
         except Exception:
             url = ""
-    if not url:
-        raise FileNotFoundError(
-            "No model weights found. Put a checkpoint at weights/cipaformer_v2_ema_fp16.pth "
-            "or set MODEL_URL (env var or Streamlit secret) to a direct download link."
-        )
+    url = url or DEFAULT_MODEL_URL
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     dest = WEIGHTS_DIR / "cipaformer_v2_ema_fp16.pth"
@@ -157,11 +157,17 @@ def resolve_weights(progress=None) -> Path:
                     progress(done / total)
     except HTTPError as e:
         tmp.unlink(missing_ok=True)
-        hint = ("GitHub answers 404 for release assets in a private repo when the request is "
-                "unauthenticated. Make the repo public, host the weights somewhere public such "
-                "as the Hugging Face Hub, or add a MODEL_TOKEN secret with repo read access."
-                ) if e.code == 404 else "Check that MODEL_URL points straight at the file."
-        raise RuntimeError(f"Could not download the weights (HTTP {e.code}). {hint}") from None
+        if e.code == 404 and "github.com" in url:
+            hint = ("GitHub answers 404 for release assets in a private repo when the request "
+                    "is unauthenticated. Host the weights publicly (the Hugging Face Hub works "
+                    "well) or add a MODEL_TOKEN secret with repo read access.")
+        elif e.code == 404:
+            hint = "Nothing is served at that URL — check the path and the file name."
+        else:
+            hint = "Check that MODEL_URL points straight at the file."
+        raise RuntimeError(
+            f"Could not download the weights (HTTP {e.code}) from\n\n`{url.split('?')[0]}`\n\n"
+            f"{hint}") from None
     except URLError as e:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"Could not reach the weights URL: {e.reason}") from None

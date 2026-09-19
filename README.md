@@ -62,14 +62,17 @@ outside it and are downloaded once at first run.
 3. **Deploy.** Go to [share.streamlit.io](https://share.streamlit.io), connect the repo, and set
    the main file to `app.py`.
 
-4. **Add the URL as a secret.** In the app's *Settings → Secrets*, paste:
+No secret is required: `DEFAULT_MODEL_URL` in `core/model.py` already points at the published
+weights, and the app fetches them on first boot with a progress bar, then caches them for the
+life of the container. To serve them from somewhere else, override with a `MODEL_URL` secret
+(or environment variable) holding a direct download link — a Streamlit secret looks like:
 
-   ```toml
-   MODEL_URL = "https://huggingface.co/<user>/cipaformer-v2-petct/resolve/main/cipaformer_v2_ema_fp16.pth"
-   ```
+```toml
+MODEL_URL = "https://huggingface.co/<user>/<repo>/resolve/main/cipaformer_v2_ema_fp16.pth"
+```
 
-The app downloads the weights on first boot (with a progress bar) and caches them for the life
-of the container. `MODEL_URL` is also read from the environment, so the same code runs anywhere.
+Note that the link must serve the raw file. On Hugging Face that means `/resolve/` in the path,
+not the `/blob/` link the file browser shows.
 
 > **On GitHub release assets:** a release asset works too, but only if the repo is **public**.
 > GitHub answers `404` for assets in a private repo unless the request is authenticated, and
